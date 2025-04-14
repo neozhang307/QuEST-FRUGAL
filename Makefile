@@ -3,7 +3,7 @@ all: build
 .PHONY: config
 config:
 	cmake -S . -B ./build -DMULTITHREADED=0 \
-	-DGPUACCELERATED=1 -DGPU_COMPUTE_CAPABILITY=80 \
+	-DGPUACCELERATED=1 -DGPU_COMPUTE_CAPABILITY=90 \
 	-DUSE_CUQUANTUM=0 -DUSE_MEMOPT=1 \
 	-DUSER_SOURCE=examples/qft.c \
 	-DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
@@ -12,7 +12,7 @@ config:
 .PHONY: config-debug
 config-debug:
 	cmake -S . -B ./build -DMULTITHREADED=0 \
-	-DGPUACCELERATED=1 -DGPU_COMPUTE_CAPABILITY=80 \
+	-DGPUACCELERATED=1 -DGPU_COMPUTE_CAPABILITY=90 \
 	-DUSE_CUQUANTUM=0 -DUSE_MEMOPT=1 \
 	-DUSER_SOURCE=examples/qft.c \
 	-DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
