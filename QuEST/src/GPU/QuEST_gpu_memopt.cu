@@ -37,9 +37,9 @@ void allocateShardAndRegister(T** p, size_t s) {
   } else {
     checkCudaErrors(cudaMalloc(p, s));
   }
-  memopt::registerManagedMemoryAddress(*p, s);
-  memopt::registerApplicationInput(*p);
-  memopt::registerApplicationOutput(*p);
+  memopt::MemoryManager::getInstance().registerManagedMemoryAddress(*p, s);
+  memopt::MemoryManager::getInstance().registerApplicationInput(*p);
+  memopt::MemoryManager::getInstance().registerApplicationOutput(*p);
 }
 
 typedef std::function<void(Qureg, cudaStream_t)> Task;
@@ -824,8 +824,10 @@ void statevec_destroyQureg(Qureg qureg, QuESTEnv env) {
 
 void applyFullQFTWithMemopt(Qureg* qureg) {
   size_t totalShardSize = 0;
-  for (const auto& [addr, size] : memopt::MemoryManager::managedMemoryAddressToSizeMap) {
-    totalShardSize += size;
+  auto& memManager = memopt::MemoryManager::getInstance();
+  const auto& memoryInfos = memManager.getMemoryArrayInfos();
+  for (const auto& info : memoryInfos) {
+    totalShardSize += info.size;
   }
   printf("totalShardSize (MiB) = %.6lf\n", (double)totalShardSize * 1e-6);
 
