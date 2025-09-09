@@ -1,139 +1,144 @@
-# TODO: Incremental Profiling for 32+ Qubit Support
+# TODO: Incremental Profiling Implementation
 
-## ✅ SOLVED: Pruning/MIP Constraint Issue
-**Problem**: MIP solver failed for 30-31 qubit cases with "No optimal solution found (ResultStatus=2)"  
-**Root Cause**: Incorrect constraint `p[i][j] + sum(o[i][j][k]) <= 1` that treated prefetch and offload as mutually exclusive  
-**Solution**: Commented out the problematic constraint in `secondStepSolver.cpp` lines 469, 471, 482  
-**Status**: RESOLVED - 37 qubit cases now solve successfully
+## Goal
+Enable QuEST to handle 32+ qubit simulations that exceed GPU memory capacity through incremental profiling and staged execution.
 
-## Current Problem
-QuEST cannot run 32+ qubit simulations due to GPU memory limitations (32GB+ requirement exceeds typical GPU capacity). Need incremental profiling to handle applications that exceed GPU memory.
+## Current Architecture Understanding
 
-## Development Strategy
-Leverage existing stage-based infrastructure in FRUGAL to profile stages individually, using Unified Memory (UM) to handle arrays that exceed GPU capacity.
+### Memory Management
+- **FRUGAL manages 16 arrays** (shards), each with arrayId 0-15
+- **QuEST wraps these into Qureg** structure for kernels
+- **Direct mapping**: arrayId in FRUGAL = shard index in QuEST
+- **Address mapping**: Both executor_v1 and executor_v2 support external address mapping via callback
 
-## Phase 1: Implement UM-based Stage Profiling (2-3 days)
+### Key Components in memopt_adapter
+1. **allocateShardAndRegister** - Allocates and registers arrays with FRUGAL
+2. **tryUpdatingAddress** - Updates pointers when FRUGAL moves arrays (interface with executor)
+3. **executeRandomTask** - Updates Qureg structure with new addresses before task execution
+4. **moveDataBackToDevice** - Restores data from storage to device (can be replaced with FRUGAL's prefetchAllDataToDevice)
 
-### Core Approach
-- Generate subgraphs for each stage separately
-- Use Unified Memory for arrays that exceed GPU capacity
-- Profile each stage subgraph with `getCudaGraphExecutionTimeline()`
-- Merge timelines for optimization
+## Implementation Strategy
 
-### Detailed Tasks
+### Phase 1: TaskManager_v2 with Immediate Execution
+**Goal**: Minimal change, keep current execution model but use TaskManager_v2 for task registration
 
-#### 1.1 Extend MemoryManager for UM Support
-- [ ] Add `registerUMAddress()` function to track UM allocations
-- [ ] Track UM addresses separately from regular GPU allocations
-- [ ] Support both UM and regular memory in same session
+```cpp
+cudaGraph_t captureCudaGraphForFullQFT_v2(cudaStream_t stream, Qureg qureg) {
+  TaskManager_v2 tmanager(stream);
+  std::vector<std::vector<TaskId>> stageTaskIds;
+  
+  checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+  
+  for (int q = qureg.numQubitsInStateVec - 1; q >= 0; q--) {
+    std::vector<TaskId> currentStageTasks;
+    
+    // Register task with TaskManager_v2
+    TaskId hadamardTask = tmanager.registerTask<...>(...);
+    currentStageTasks.push_back(hadamardTask);
+    
+    // Execute immediately (captures into graph)
+    tmanager.executeTask(hadamardTask, stream);
+    
+    // Register phase function task
+    TaskId phaseTask = tmanager.registerTask<...>(...);
+    currentStageTasks.push_back(phaseTask);
+    tmanager.executeTask(phaseTask, stream);
+    
+    stageTaskIds.push_back(currentStageTasks);
+    memopt::endStage(stream);  // Mark stage boundary
+  }
+  
+  // Swap operations
+  for (int i = 0; i < (qureg.numQubitsInStateVec / 2); i++) {
+    // Similar pattern...
+  }
+  
+  cudaGraph_t graph;
+  checkCudaErrors(cudaStreamEndCapture(stream, &graph));
+  return graph;
+}
+```
 
-#### 1.2 Add UM→Storage Migration
-- [ ] Implement `moveUMToStorage()` function
-- [ ] Allocate CPU storage for each UM array
-- [ ] Copy UM content to storage before main execution
-- [ ] Free UM allocations after migration
-- [ ] Update address mappings
+**Benefits**:
+- Tasks registered in TaskManager_v2 (provides task structure for optimization)
+- Immediate execution maintains current behavior
+- Can use both regular and staged optimization
+- Minimal code changes
 
-#### 1.3 Modify QuEST Allocation
-- [ ] Add profiling mode flag to QuEST
-- [ ] Use `cudaMallocManaged()` when profiling large problems
-- [ ] Register UM addresses with MemoryManager
-- [ ] Keep same pointers throughout (no remapping needed)
+### Phase 2: Switch to executor_v2 and Staged Optimization
+**Goal**: Use staged profiling and optimization
 
-#### 1.4 Implement Stage Subgraph Generation
-- [ ] Capture task execution order (not full graph) initially
-- [ ] For each stage, replay only that stage's tasks
-- [ ] Generate `cudaGraph_t` subgraph per stage
-- [ ] Maintain correct task IDs and dependencies
+```cpp
+void applyFullQFTWithMemopt_v2(Qureg* qureg) {
+  TaskManager_v2 tmanager(stream);
+  std::vector<std::vector<TaskId>> stageTaskIds;
+  
+  // Phase 1: Register all tasks and build stage structure
+  buildQFTTasksAndStages(tmanager, stageTaskIds, *qureg);
+  
+  // Phase 2: Staged optimization
+  auto optimizedGraph = profileAndOptimizeStaged(tmanager, stageTaskIds, stream);
+  
+  // Phase 3: Execute with executor_v2
+  auto& memManager = MemoryManager::getInstance();
+  memopt::executeOptimizedGraph(
+    optimizedGraph,
+    [=](int taskId, std::map<void*, void*> addressUpdate, cudaStream_t stream) {
+      memopt_adapter::executeRandomTask(*qureg, taskId, addressUpdate, stream);
+    },
+    runningTime,
+    memManager  // executor_v2 takes MemoryManager reference
+  );
+  
+  // Restore data to device
+  memManager.prefetchAllDataToDevice(stream);
+  // Update Qureg pointers...
+}
+```
 
-#### 1.5 Add Memory Prefetch Before Profiling
-- [ ] Calculate memory requirement per stage
-- [ ] Check if stage fits in GPU memory
-- [ ] Use `cudaMemPrefetchAsync()` to migrate arrays to GPU
-- [ ] **Alternative**: Execute the stage graph once to ensure 100% data migration to GPU
-- [ ] Ensure migration complete with `cudaDeviceSynchronize()`
-- [ ] Note: Executing graph once guarantees all data is on GPU (more reliable than prefetch)
+### Phase 3: Incremental Profiling (Deferred Execution)
+**Goal**: Profile stages incrementally without capturing full graph
 
-#### 1.6 Profile Stages Individually
-- [ ] For each stage subgraph, call `getCudaGraphExecutionTimeline()`
-- [ ] Handle UM page faults gracefully
-- [ ] Collect timing information per stage
+```cpp
+// Register tasks WITHOUT immediate execution
+for (int q = qureg.numQubitsInStateVec - 1; q >= 0; q--) {
+  // Only register, don't execute
+  TaskId hadamardTask = tmanager.registerTask<...>(...);
+  TaskId phaseTask = tmanager.registerTask<...>(...);
+  
+  currentStageTasks.push_back(hadamardTask);
+  currentStageTasks.push_back(phaseTask);
+  stageTaskIds.push_back(currentStageTasks);
+}
 
-#### 1.7 Merge Stage Timelines
-- [ ] Combine individual stage timelines
-- [ ] Adjust timestamps for sequential execution
-- [ ] Create unified timeline for optimization
+// Now profile incrementally - each stage fits in memory
+auto optimizedGraph = profileAndOptimizeStaged(tmanager, stageTaskIds, stream);
+```
 
-#### 1.8 Test with 32+ Qubit Cases
-- [ ] Test with 32 qubit QFT
-- [ ] Verify memory stays within GPU limits during profiling
-- [ ] Validate optimization results
-- [ ] Measure performance overhead
+## Key Advantages of This Approach
 
-## Phase 2: Optimize Stage Sizes (1 day)
+1. **Incremental Migration**: Each phase builds on the previous one
+2. **Keep Current Interface**: The `executeRandomTask` callback works with both executors
+3. **Address Mapping Unchanged**: `tryUpdatingAddress` continues to work as the interface
+4. **Enable Large Problems**: Staged execution allows 32+ qubit simulations
 
-### Goal
-Increase stage sizes for better efficiency while staying within GPU memory limits
+## Priority Order
 
-### Tasks
+1. **Migrate to executor_v2** (enables staged execution)
+2. **Implement staged QFT** with TaskManager_v2
+3. **Test incremental profiling** for large qubit counts
+4. **Optimize MemoryManager integration** (future improvement)
 
-#### 2.1 Analyze Current Stage Boundaries
-- [ ] Profile current stage sizes in QuEST QFT
-- [ ] Measure memory usage per stage
-- [ ] Identify bottlenecks
+## Testing Milestones
 
-#### 2.2 Reduce endStage() Frequency
-- [ ] Modify QuEST to use fewer, larger stages
-- [ ] Example: Stage per 5-10 qubits instead of per qubit
-- [ ] Balance memory usage vs optimization complexity
+- [ ] Phase 1 works with current qubit sizes (verify no regression)
+- [ ] Phase 2 successfully uses staged optimization
+- [ ] Phase 3 handles 32+ qubits without OOM
+- [ ] Performance comparison vs. non-staged execution
 
-#### 2.3 Find Optimal Balance
-- [ ] Test different stage sizes
-- [ ] Measure profiling overhead
-- [ ] Measure optimization time
-- [ ] Find sweet spot
+## Notes
 
-#### 2.4 Performance Benchmarking
-- [ ] Compare execution time: many small stages vs fewer large stages
-- [ ] Measure memory transfer overhead
-- [ ] Document optimal configuration
-
-## Phase 3: Future - Automatic Graph Splitting (Future TODO)
-
-### Goal
-Automatically split graphs based on memory capacity without manual staging
-
-### Future Tasks
-
-#### 3.1 Design Automatic Memory-based Splitting
-- [ ] Estimate memory requirements per task
-- [ ] Design algorithm to group tasks within memory limit
-- [ ] Handle complex dependency patterns
-
-#### 3.2 Implement Dependency-aware Partitioning
-- [ ] Respect task dependencies when splitting
-- [ ] Minimize cross-partition dependencies
-- [ ] Optimize for locality
-
-#### 3.3 Remove Need for Manual endStage()
-- [ ] System automatically determines stage boundaries
-- [ ] Dynamic adjustment based on available GPU memory
-- [ ] Support for heterogeneous GPU configurations
-
-## Implementation Notes
-
-### Key Files
-- `dependencies/optimize-cuda-memory-usage-v1/optimization/optimizer.cu` - Stage handling
-- `dependencies/optimize-cuda-memory-usage-v1/profiling/memoryManager.cu` - Memory management
-- `QuEST/src/GPU/QuEST_gpu_memopt.cu` - QuEST integration
-
-### Success Criteria
-- 32+ qubit simulations run successfully
-- Memory usage stays within GPU limits during profiling
-- Performance overhead acceptable (<2x slowdown)
-- Solution reusable for other memory-limited applications
-
-### Timeline
-- Phase 1: 2-3 days
-- Phase 2: 1 day  
-- Phase 3: Future work (document for later implementation)
+- The `addressUpdateMap` interface is intentional and works with both v1 and v2
+- FRUGAL's MemoryManager internally tracks array movements
+- QuEST's adapter layer correctly bridges between FRUGAL's array view and QuEST's Qureg structure
+- Inter-stage offloading (arrayId == -1) is now properly handled in executor.cu

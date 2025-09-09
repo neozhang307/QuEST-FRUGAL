@@ -1,3 +1,4 @@
 [submodule "dependencies/optimize-cuda-memory-usage-v1"]
 	path = dependencies/optimize-cuda-memory-usage-v1
 	url = git@github.com:neozhang307/FRUGAL-base.git
+	branch = integration/quest

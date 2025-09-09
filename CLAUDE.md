@@ -8,6 +8,15 @@ Please also read `dependencies/optimize-cuda-memory-usage-v1/CLAUDE.md` for addi
 ### **Primary Goal**
 Enable QuEST to run 32+ qubit simulations that exceed GPU memory capacity (32GB+ requirement for 32 qubits on typical GPUs).
 
+### **Important Finding: Unified Memory Limitations**
+**Date: 2025-01-09**
+- **Issue**: Using cudaMallocManaged (Unified Memory) for incremental profiling is **impractical** due to severe performance issues
+- **Problems identified**:
+  1. CPU-side initialization is extremely slow for large matrices
+  2. Even with prefetching (cudaMemPrefetchAsync), profiling hangs or takes impractically long
+  3. Page fault overhead during graph execution makes it unsuitable for production use
+- **Recommendation**: Need alternative approach that doesn't rely on Unified Memory for large problem sizes
+
 ### **Development Plan**
 
 #### Phase 1: UserApplication Prototype (In Progress)

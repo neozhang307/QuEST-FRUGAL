@@ -1,0 +1,82 @@
+# Makefile for QuEST Staged Implementation Test
+# This builds the staged QFT test with FRUGAL v2 API
+
+# CUDA configuration
+CUDA_PATH ?= /usr/local/cuda
+NVCC = $(CUDA_PATH)/bin/nvcc
+
+# Compiler flags
+NVCC_FLAGS = -std=c++17 -O3 -lineinfo
+NVCC_FLAGS += -gencode arch=compute_70,code=sm_70
+NVCC_FLAGS += -gencode arch=compute_80,code=sm_80
+NVCC_FLAGS += -gencode arch=compute_90,code=sm_90
+
+# Include paths
+INCLUDES = -I$(CUDA_PATH)/include
+INCLUDES += -I./QuEST/include
+INCLUDES += -I./dependencies/optimize-cuda-memory-usage-v1/include
+INCLUDES += -I./dependencies/optimize-cuda-memory-usage-v1/public
+
+# Library paths
+LDFLAGS = -L$(CUDA_PATH)/lib64
+LDFLAGS += -L./dependencies/optimize-cuda-memory-usage-v1/build
+
+# Libraries
+LIBS = -lcudart -lcublas -lcusolver -lcurand
+LIBS += -lmemopt -lfmt -lgomp
+
+# OpenMP flags
+OPENMP_FLAGS = -Xcompiler -fopenmp
+
+# Target executable
+TARGET = test_staged_qft
+
+# Source files
+SOURCES = test_staged_qft.cu
+
+# Build rules
+all: $(TARGET)
+
+$(TARGET): $(SOURCES)
+	$(NVCC) $(NVCC_FLAGS) $(OPENMP_FLAGS) $(INCLUDES) $(SOURCES) -o $(TARGET) $(LDFLAGS) $(LIBS)
+
+# Run tests with different qubit counts
+test10:
+	./$(TARGET) 10
+
+test20:
+	./$(TARGET) 20
+
+test30:
+	./$(TARGET) 30
+
+test32:
+	./$(TARGET) 32
+
+test34:
+	./$(TARGET) 34
+
+# Run all incremental tests
+test-all:
+	./$(TARGET)
+
+# Clean build artifacts
+clean:
+	rm -f $(TARGET) *.o
+
+# Help message
+help:
+	@echo "QuEST Staged Implementation Makefile"
+	@echo "======================================"
+	@echo "Targets:"
+	@echo "  all        - Build the test executable"
+	@echo "  test10     - Test with 10 qubits"
+	@echo "  test20     - Test with 20 qubits"
+	@echo "  test30     - Test with 30 qubits"
+	@echo "  test32     - Test with 32 qubits"
+	@echo "  test34     - Test with 34 qubits"
+	@echo "  test-all   - Run all incremental tests"
+	@echo "  clean      - Remove build artifacts"
+	@echo "  help       - Show this message"
+
+.PHONY: all clean test10 test20 test30 test32 test34 test-all help

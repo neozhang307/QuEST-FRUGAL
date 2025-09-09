@@ -1,0 +1,217 @@
+# Integrated Makefile for QuEST with both original and staged implementations
+# This extends the existing build system without conflicts
+
+# ============================================================================
+# ORIGINAL TARGETS (v1 API) - Preserved from existing Makefile
+# ============================================================================
+
+all: build
+
+.PHONY: config
+config:
+	cmake -S . -B ./build -DMULTITHREADED=0 \
+	-DGPUACCELERATED=1 -DGPU_COMPUTE_CAPABILITY=90 \
+	-DUSE_CUQUANTUM=0 -DUSE_MEMOPT=1 \
+	-DUSER_SOURCE=examples/qft.c \
+	-DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
+	-DCMAKE_PREFIX_PATH=${ORTOOLS_ROOT}
+
+.PHONY: config-debug
+config-debug:
+	cmake -S . -B ./build -DMULTITHREADED=0 \
+	-DGPUACCELERATED=1 -DGPU_COMPUTE_CAPABILITY=90 \
+	-DUSE_CUQUANTUM=0 -DUSE_MEMOPT=1 \
+	-DUSER_SOURCE=examples/qft.c \
+	-DCMAKE_TOOLCHAIN_FILE=${VCPKG_ROOT}/scripts/buildsystems/vcpkg.cmake \
+	-DCMAKE_PREFIX_PATH=${ORTOOLS_ROOT} \
+	-DCMAKE_BUILD_TYPE=Debug
+
+.PHONY: build
+build:
+	cmake --build ./build -j
+
+.PHONY: build-sequential
+build-sequential:
+	cmake --build ./build
+
+.PHONY: clean
+clean:
+	rm -rf ./build
+
+.PHONY: update-memopt
+update-memopt:
+	git submodule update --remote dependencies/optimize-cuda-memory-usage-v1/
+
+# ============================================================================
+# NEW STAGED TARGETS (v2 API) - Non-conflicting additions
+# ============================================================================
+
+# Build directory for staged implementation (separate from main build)
+BUILD_STAGED_DIR = ./build_staged
+
+# CUDA configuration
+CUDA_PATH ?= /usr/local/cuda
+NVCC = $(CUDA_PATH)/bin/nvcc
+
+# Compiler flags for staged build
+NVCC_FLAGS_STAGED = -std=c++17 -O3 -lineinfo
+NVCC_FLAGS_STAGED += -gencode arch=compute_70,code=sm_70
+NVCC_FLAGS_STAGED += -gencode arch=compute_80,code=sm_80
+NVCC_FLAGS_STAGED += -gencode arch=compute_90,code=sm_90
+
+# Include paths for staged
+INCLUDES_STAGED = -I$(CUDA_PATH)/include
+INCLUDES_STAGED += -I./QuEST/include
+INCLUDES_STAGED += -I./QuEST/src
+INCLUDES_STAGED += -I./dependencies/optimize-cuda-memory-usage-v1/include
+INCLUDES_STAGED += -I./dependencies/optimize-cuda-memory-usage-v1/public
+
+# Library paths for staged
+LDFLAGS_STAGED = -L$(CUDA_PATH)/lib64
+LDFLAGS_STAGED += -L$(CUDA_PATH)/extras/CUPTI/lib64
+LDFLAGS_STAGED += -L./dependencies/optimize-cuda-memory-usage-v1/build
+LDFLAGS_STAGED += -L./dependencies/optimize-cuda-memory-usage-v1/build/profiling
+LDFLAGS_STAGED += -L./dependencies/optimize-cuda-memory-usage-v1/build/optimization
+LDFLAGS_STAGED += -L./dependencies/optimize-cuda-memory-usage-v1/build/vcpkg_installed/arm64-linux/lib
+
+# Libraries for staged (order matters for static linking)
+LIBS_STAGED = -lcudart -lcublas -lcusolver -lcurand -lcupti
+LIBS_STAGED += -lmemoryManager -lannotation -lpeakMemoryUsageProfiler
+LIBS_STAGED += -lcudaGraphExecutionTimelineProfiler -loptimization 
+LIBS_STAGED += -lfmt -lgomp
+
+# OpenMP flags
+OPENMP_FLAGS = -Xcompiler -fopenmp
+
+# Staged executables (non-conflicting names)
+STAGED_TEST = test_staged_qft
+STAGED_DEMO = demo_staged
+
+# Create build directory for staged
+.PHONY: config-staged
+config-staged:
+	@mkdir -p $(BUILD_STAGED_DIR)
+	@echo "Created staged build directory: $(BUILD_STAGED_DIR)"
+
+# Build staged test executable
+.PHONY: build-staged-test
+build-staged-test: config-staged
+	@echo "Building staged test executable..."
+	$(NVCC) $(NVCC_FLAGS_STAGED) $(OPENMP_FLAGS) $(INCLUDES_STAGED) \
+		test_staged_qft.cu -o $(BUILD_STAGED_DIR)/$(STAGED_TEST) \
+		$(LDFLAGS_STAGED) $(LIBS_STAGED)
+	@echo "Staged test built: $(BUILD_STAGED_DIR)/$(STAGED_TEST)"
+
+# Build staged demo (when kernels are ready)
+.PHONY: build-staged-demo
+build-staged-demo: config-staged
+	@echo "Building staged demo executable..."
+	@echo "Note: This requires kernel implementations to be complete"
+	# Uncomment when ready:
+	# $(NVCC) $(NVCC_FLAGS_STAGED) $(OPENMP_FLAGS) $(INCLUDES_STAGED) \
+	#	examples/qft_staged.c -o $(BUILD_STAGED_DIR)/$(STAGED_DEMO) \
+	#	$(LDFLAGS_STAGED) $(LIBS_STAGED)
+
+# ============================================================================
+# TESTING TARGETS - Run both original and staged versions
+# ============================================================================
+
+# Run original demo
+.PHONY: run
+run: build
+	./build/demo
+
+# Run staged tests with different qubit counts
+.PHONY: test-staged-10
+test-staged-10: build-staged-test
+	$(BUILD_STAGED_DIR)/$(STAGED_TEST) 10
+
+.PHONY: test-staged-20
+test-staged-20: build-staged-test
+	$(BUILD_STAGED_DIR)/$(STAGED_TEST) 20
+
+.PHONY: test-staged-30
+test-staged-30: build-staged-test
+	$(BUILD_STAGED_DIR)/$(STAGED_TEST) 30
+
+.PHONY: test-staged-32
+test-staged-32: build-staged-test
+	$(BUILD_STAGED_DIR)/$(STAGED_TEST) 32
+
+.PHONY: test-staged-34
+test-staged-34: build-staged-test
+	$(BUILD_STAGED_DIR)/$(STAGED_TEST) 34
+
+# Run all staged tests
+.PHONY: test-staged-all
+test-staged-all: build-staged-test
+	@echo "Running all staged tests..."
+	$(BUILD_STAGED_DIR)/$(STAGED_TEST)
+
+# Compare original vs staged (when both are ready)
+.PHONY: compare
+compare: build build-staged-test
+	@echo "=== Original Implementation (v1 API) ==="
+	time ./build/demo
+	@echo ""
+	@echo "=== Staged Implementation (v2 API) ==="
+	time $(BUILD_STAGED_DIR)/$(STAGED_TEST) 30
+
+# ============================================================================
+# UTILITY TARGETS
+# ============================================================================
+
+# Clean everything (original + staged)
+.PHONY: clean-all
+clean-all: clean
+	rm -rf $(BUILD_STAGED_DIR)
+	rm -f $(STAGED_TEST) $(STAGED_DEMO)
+
+# Show GPU info
+.PHONY: gpu-info
+gpu-info:
+	nvidia-smi --query-gpu=name,memory.total,memory.free --format=csv
+
+# Check dependencies
+.PHONY: check-deps
+check-deps:
+	@echo "Checking dependencies..."
+	@echo -n "CUDA: "; nvcc --version | head -1
+	@echo -n "FRUGAL library: "; \
+		ls dependencies/optimize-cuda-memory-usage-v1/build/libmemopt.a 2>/dev/null && echo "Found" || echo "Not built"
+	@echo -n "Config file: "; \
+		ls config.json 2>/dev/null && echo "Found" || echo "Not found"
+
+# ============================================================================
+# HELP
+# ============================================================================
+
+.PHONY: help
+help:
+	@echo "QuEST Integrated Makefile - Original + Staged Implementations"
+	@echo "=============================================================="
+	@echo ""
+	@echo "ORIGINAL TARGETS (v1 API, existing system):"
+	@echo "  make config        - Configure CMake build"
+	@echo "  make build         - Build original demo with v1 API"
+	@echo "  make run           - Run original demo"
+	@echo "  make clean         - Clean original build"
+	@echo ""
+	@echo "STAGED TARGETS (v2 API, new implementation):"
+	@echo "  make build-staged-test     - Build staged test executable"
+	@echo "  make test-staged-30        - Test staged with 30 qubits"
+	@echo "  make test-staged-32        - Test staged with 32 qubits"
+	@echo "  make test-staged-34        - Test staged with 34 qubits"
+	@echo "  make test-staged-all       - Run all staged tests"
+	@echo ""
+	@echo "COMPARISON:"
+	@echo "  make compare       - Compare original vs staged"
+	@echo ""
+	@echo "UTILITIES:"
+	@echo "  make gpu-info      - Show GPU memory info"
+	@echo "  make check-deps    - Check all dependencies"
+	@echo "  make clean-all     - Clean everything"
+	@echo ""
+	@echo "Build directories:"
+	@echo "  Original: ./build/"
+	@echo "  Staged:   ./build_staged/"
