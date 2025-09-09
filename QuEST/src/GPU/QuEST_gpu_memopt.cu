@@ -541,6 +541,153 @@ __global__ void statevec_swapQubitAmpsBothGlobalKernel(
 
 
 
+// Version 2: Using TaskManager_v2 with immediate execution
+cudaGraph_t captureCudaGraphForFullQFT_v2(cudaStream_t stream, Qureg qureg) {
+  // Does not support density matrix
+  assert(!qureg.isDensityMatrix);
+  
+  // Create TaskManager_v2
+  memopt::TaskManager_v2 tmanager(true);  // true for immediate mode
+  std::vector<std::vector<memopt::TaskId>> stageTaskIds;
+  
+  checkCudaErrors(cudaStreamBeginCapture(stream, cudaStreamCaptureModeGlobal));
+  
+  // Start with top/left-most qubit, work down
+  for (int q = qureg.numQubitsInStateVec - 1; q >= 0; q--) {
+    std::vector<memopt::TaskId> currentStageTasks;
+    
+    // Register and execute Hadamard tasks
+    {
+      int targetQubit = q;
+      if (targetQubit < qureg.numLocalBits) {
+        // Local bit Hadamard
+        StateVecIndex_t numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+        StateVecIndex_t numBlocks = ((qureg.numAmpsPerShard >> 1) + numThreadsPerBlock - 1) / numThreadsPerBlock;
+        
+        for (StateVecIndex_t i = 0; i < qureg.numShards; i++) {
+          std::vector<void*> inputs = {qureg.deviceStateVecShards[i].real};
+          std::vector<void*> outputs = {qureg.deviceStateVecShards[i].real};
+          
+          auto taskId = tmanager.registerTask<std::function<void(cudaStream_t)>>(
+            [=](cudaStream_t s) {
+              statevec_hadamardLocalBitKernel<<<numBlocks, numThreadsPerBlock, 0, s>>>(
+                convertToKernelParamQureg(qureg),
+                qureg.deviceStateVecShards[i],
+                targetQubit
+              );
+            },
+            inputs, outputs,
+            memopt::TaskManager_v2::makeArgs(),
+            "hadamard_local_" + std::to_string(q) + "_shard_" + std::to_string(i)
+          );
+          
+          currentStageTasks.push_back(taskId);
+          tmanager.execute(taskId, stream);  // Immediate execution
+        }
+      } else {
+        // Global bit Hadamard
+        StateVecIndex_t numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+        StateVecIndex_t numBlocks = (qureg.numAmpsPerShard + numThreadsPerBlock - 1) / numThreadsPerBlock;
+        
+        for (StateVecIndex_t i = 0; i < (qureg.numShards >> 1); i++) {
+          StateVecIndex_t globalIndexUp = insertZeroBit(i, targetQubit - qureg.numLocalBits);
+          StateVecIndex_t globalIndexLo = flipBit(globalIndexUp, targetQubit - qureg.numLocalBits);
+          
+          std::vector<void*> inputs = {
+            qureg.deviceStateVecShards[globalIndexUp].real,
+            qureg.deviceStateVecShards[globalIndexLo].real
+          };
+          std::vector<void*> outputs = {
+            qureg.deviceStateVecShards[globalIndexUp].real,
+            qureg.deviceStateVecShards[globalIndexLo].real
+          };
+          
+          auto taskId = tmanager.registerTask<std::function<void(cudaStream_t)>>(
+            [=](cudaStream_t s) {
+              statevec_hadamardGlobalBitKernel<<<numBlocks, numThreadsPerBlock, 0, s>>>(
+                convertToKernelParamQureg(qureg),
+                qureg.deviceStateVecShards[globalIndexUp],
+                qureg.deviceStateVecShards[globalIndexLo],
+                targetQubit
+              );
+            },
+            inputs, outputs,
+            memopt::TaskManager_v2::makeArgs(),
+            "hadamard_global_" + std::to_string(q) + "_pair_" + std::to_string(i)
+          );
+          
+          currentStageTasks.push_back(taskId);
+          tmanager.execute(taskId, stream);  // Immediate execution
+        }
+      }
+    }
+    
+    if (q == 0) {
+      stageTaskIds.push_back(currentStageTasks);
+      break;
+    }
+    
+    // Register and execute phase function tasks
+    {
+      ApplyParamNamedPhaseFuncOverridesParams params;
+      params.numRegs = 2;
+      params.numQubitsPerReg[0] = q;
+      params.numQubitsPerReg[1] = 1;
+      for (int i = 0; i < q + 1; i++)
+        params.qubits[i] = i;
+      
+      params.numParams = 1;
+      params.params[1] = M_PI / (1 << q);
+      
+      params.encoding = UNSIGNED;
+      params.phaseFuncName = SCALED_PRODUCT;
+      params.numOverrides = 0;
+      params.conj = 0;
+      
+      StateVecIndex_t numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+      StateVecIndex_t numBlocks = (qureg.numAmpsPerShard + numThreadsPerBlock - 1) / numThreadsPerBlock;
+      
+      for (StateVecIndex_t i = 0; i < qureg.numShards; i++) {
+        std::vector<void*> inputs = {qureg.deviceStateVecShards[i].real};
+        std::vector<void*> outputs = {qureg.deviceStateVecShards[i].real};
+        
+        auto taskId = tmanager.registerTask<std::function<void(cudaStream_t)>>(
+          [=](cudaStream_t s) {
+            statevec_applyParamNamedPhaseFuncOverridesKernel<<<numBlocks, numThreadsPerBlock, 
+              numThreadsPerBlock * params.numRegs * sizeof(StateVecIndex_t), s>>>(
+              convertToKernelParamQureg(qureg),
+              params,
+              qureg.deviceStateVecShards[i],
+              i
+            );
+          },
+          inputs, outputs,
+          memopt::TaskManager_v2::makeArgs(),
+          "phase_func_" + std::to_string(q) + "_shard_" + std::to_string(i)
+        );
+        
+        currentStageTasks.push_back(taskId);
+        tmanager.execute(taskId, stream);  // Immediate execution
+      }
+    }
+    
+    stageTaskIds.push_back(currentStageTasks);
+    memopt::endStage(stream);
+  }
+  
+  // Continue with swap operations...
+  // (Similar pattern for swap operations)
+  
+  cudaGraph_t graph;
+  checkCudaErrors(cudaStreamEndCapture(stream, &graph));
+  
+  // Store the task structure for later use with staged optimization
+  // tmanager and stageTaskIds can be used with profileAndOptimizeStaged
+  
+  return graph;
+}
+
+// Original version for compatibility
 cudaGraph_t captureCudaGraphForFullQFT(cudaStream_t stream, Qureg qureg) {
   // Does not support density matrix
   assert(!qureg.isDensityMatrix);
