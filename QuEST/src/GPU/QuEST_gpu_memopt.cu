@@ -82,6 +82,12 @@ void executeRandomTask(Qureg qureg, int taskId, std::map<void*, void*> addressUp
 
 template <typename T>
 void moveDataBackToDevice(T*& oldAddress, const std::map<void*, void*>& managedDeviceArrayToHostArrayMap, size_t numAmpsPerShard) {
+  // Check if address was actually moved to host
+  if (managedDeviceArrayToHostArrayMap.count(oldAddress) == 0) {
+    // Address not in map - data wasn't moved to host, so no need to move back
+    return;
+  }
+  
   auto newAddress = managedDeviceArrayToHostArrayMap.at(oldAddress);
   checkCudaErrors(cudaMalloc(&oldAddress, 2 * numAmpsPerShard * sizeof(qreal)));
   checkCudaErrors(cudaMemcpy(oldAddress, newAddress, 2 * numAmpsPerShard * sizeof(qreal), cudaMemcpyDefault));
@@ -685,29 +691,98 @@ cudaGraph_t captureCudaGraphForFullQFT(cudaStream_t stream, Qureg qureg) {
 
   // Start with top/left-most qubit, work down
   for (int q = qureg.numQubitsInStateVec - 1; q >= 0; q--) {
-    memopt_statevec_hadamard(stream, qureg, q);
+    // Inline memopt_statevec_hadamard
+    {
+      int targetQubit = q;
+      if (targetQubit < qureg.numLocalBits) {
+        StateVecIndex_t numThreadsPerBlock, numBlocks;
+        numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+        numBlocks = ((qureg.numAmpsPerShard >> 1) + numThreadsPerBlock - 1) / numThreadsPerBlock;
+
+        for (StateVecIndex_t i = 0; i < qureg.numShards; i++) {
+          memopt_adapter::Task task = [=](Qureg q, cudaStream_t s) {
+            statevec_hadamardLocalBitKernel<<<numBlocks, numThreadsPerBlock, 0, s>>>(
+              convertToKernelParamQureg(q),
+              q.deviceStateVecShards[i],
+              targetQubit
+            );
+          };
+          memopt_adapter::registerAndExecuteTask(
+            {i},
+            task,
+            qureg,
+            stream
+          );
+        }
+      } else {
+        StateVecIndex_t numThreadsPerBlock, numBlocks;
+        numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+        numBlocks = (qureg.numAmpsPerShard + numThreadsPerBlock - 1) / numThreadsPerBlock;
+
+        for (StateVecIndex_t i = 0; i < (qureg.numShards >> 1); i++) {
+          StateVecIndex_t globalIndexUp = insertZeroBit(i, targetQubit - qureg.numLocalBits);
+          StateVecIndex_t globalIndexLo = flipBit(globalIndexUp, targetQubit - qureg.numLocalBits);
+          memopt_adapter::Task task = [=](Qureg q, cudaStream_t s) {
+            statevec_hadamardGlobalBitKernel<<<numBlocks, numThreadsPerBlock, 0, s>>>(
+              convertToKernelParamQureg(q),
+              q.deviceStateVecShards[globalIndexUp],
+              q.deviceStateVecShards[globalIndexLo],
+              targetQubit
+            );
+          };
+          memopt_adapter::registerAndExecuteTask(
+            {globalIndexUp, globalIndexLo},
+            task,
+            qureg,
+            stream
+          );
+        }
+      }
+    }
 
     if (q == 0)
       break;
 
-    ApplyParamNamedPhaseFuncOverridesParams params;
-    params.numRegs = 2;
-    params.numQubitsPerReg[0] = q;
-    params.numQubitsPerReg[1] = 1;
-    for (int i = 0; i < q + 1; i++)
-      params.qubits[i] = i;
+    // Inline memopt_statevec_applyParamNamedPhaseFuncOverrides
+    {
+      ApplyParamNamedPhaseFuncOverridesParams params;
+      params.numRegs = 2;
+      params.numQubitsPerReg[0] = q;
+      params.numQubitsPerReg[1] = 1;
+      for (int i = 0; i < q + 1; i++)
+        params.qubits[i] = i;
 
-    params.numParams = 1;
-    params.params[1] = M_PI / (1 << q);
+      params.numParams = 1;
+      params.params[1] = M_PI / (1 << q);
 
-    params.encoding = UNSIGNED;
-    params.phaseFuncName = SCALED_PRODUCT;
+      params.encoding = UNSIGNED;
+      params.phaseFuncName = SCALED_PRODUCT;
 
-    params.numOverrides = 0;
+      params.numOverrides = 0;
 
-    params.conj = 0;
+      params.conj = 0;
 
-    memopt_statevec_applyParamNamedPhaseFuncOverrides(stream, qureg, params);
+      StateVecIndex_t numThreadsPerBlock, numBlocks;
+      numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+      numBlocks = (qureg.numAmpsPerShard + numThreadsPerBlock - 1) / numThreadsPerBlock;
+
+      for (StateVecIndex_t i = 0; i < qureg.numShards; i++) {
+        memopt_adapter::Task task = [=](Qureg q, cudaStream_t s) {
+          statevec_applyParamNamedPhaseFuncOverridesKernel<<<numBlocks, numThreadsPerBlock, numThreadsPerBlock * params.numRegs * sizeof(StateVecIndex_t), s>>>(
+            convertToKernelParamQureg(q),
+            params,
+            q.deviceStateVecShards[i],
+            i
+          );
+        };
+        memopt_adapter::registerAndExecuteTask(
+          {i},
+          task,
+          qureg,
+          stream
+        );
+      }
+    }
 
     memopt::endStage(stream);
   }
@@ -716,7 +791,85 @@ cudaGraph_t captureCudaGraphForFullQFT(cudaStream_t stream, Qureg qureg) {
     int qb1 = i;
     int qb2 = qureg.numQubitsInStateVec - i - 1;
 
-    memopt_statevec_swapQubitAmps(stream, qureg, qb1, qb2);
+    // Inline memopt_statevec_swapQubitAmps
+    {
+      // Make sure qb1 < qb2 (already guaranteed by construction above)
+      
+      if (qb2 < qureg.numLocalBits) {
+        // Both are local bits
+        StateVecIndex_t numThreadsPerBlock, numBlocks;
+        numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+        numBlocks = ((qureg.numAmpsPerShard >> 2) + numThreadsPerBlock - 1) / numThreadsPerBlock;
+
+        for (StateVecIndex_t j = 0; j < qureg.numShards; j++) {
+          memopt_adapter::Task task = [=](Qureg q, cudaStream_t s) {
+            statevec_swapQubitAmpsBothLocalKernel<<<numBlocks, numThreadsPerBlock, 0, s>>>(
+              convertToKernelParamQureg(q),
+              q.deviceStateVecShards[j],
+              qb1,
+              qb2
+            );
+          };
+          memopt_adapter::registerAndExecuteTask(
+            {j},
+            task,
+            qureg,
+            stream
+          );
+        }
+      } else if (qb1 >= qureg.numLocalBits) {
+        // Both are global bits
+        StateVecIndex_t numThreadsPerBlock, numBlocks;
+        numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+        numBlocks = (qureg.numAmpsPerShard + numThreadsPerBlock - 1) / numThreadsPerBlock;
+
+        for (StateVecIndex_t j = 0; j < (qureg.numShards >> 2); j++) {
+          StateVecIndex_t globalIndex00 = insertTwoZeroBits(j, qb1 - qureg.numLocalBits, qb2 - qureg.numLocalBits);
+          StateVecIndex_t globalIndex01 = flipBit(globalIndex00, qb1 - qureg.numLocalBits);
+          StateVecIndex_t globalIndex10 = flipBit(globalIndex00, qb2 - qureg.numLocalBits);
+
+          memopt_adapter::Task task = [=](Qureg q, cudaStream_t s) {
+            statevec_swapQubitAmpsBothGlobalKernel<<<numBlocks, numThreadsPerBlock, 0, s>>>(
+              convertToKernelParamQureg(q),
+              q.deviceStateVecShards[globalIndex01],
+              q.deviceStateVecShards[globalIndex10]
+            );
+          };
+          memopt_adapter::registerAndExecuteTask(
+            {globalIndex01, globalIndex10},
+            task,
+            qureg,
+            stream
+          );
+        }
+      } else {
+        // qb1 is local bit while qb2 is global bit
+        StateVecIndex_t numThreadsPerBlock, numBlocks;
+        numThreadsPerBlock = NUM_THREADS_PER_BLOCK;
+        numBlocks = ((qureg.numAmpsPerShard >> 1) + numThreadsPerBlock - 1) / numThreadsPerBlock;
+
+        for (StateVecIndex_t j = 0; j < (qureg.numShards >> 1); j++) {
+          StateVecIndex_t globalIndexUp = insertZeroBit(j, qb2 - qureg.numLocalBits);
+          StateVecIndex_t globalIndexLo = flipBit(globalIndexUp, qb2 - qureg.numLocalBits);
+
+          memopt_adapter::Task task = [=](Qureg q, cudaStream_t s) {
+            statevec_swapQubitAmpsOneLocalOneGlobalKernel<<<numBlocks, numThreadsPerBlock, 0, s>>>(
+              convertToKernelParamQureg(q),
+              q.deviceStateVecShards[globalIndexUp],
+              q.deviceStateVecShards[globalIndexLo],
+              qb1,
+              qb2
+            );
+          };
+          memopt_adapter::registerAndExecuteTask(
+            {globalIndexUp, globalIndexLo},
+            task,
+            qureg,
+            stream
+          );
+        }
+      }
+    }
 
     if ((i + 1) % 2 == 0 || (i + 1) == qureg.numQubitsInStateVec / 2) {
       memopt::endStage(stream);
