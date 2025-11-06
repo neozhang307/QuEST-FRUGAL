@@ -8,7 +8,7 @@
     "useNvlink": false
   },
   "generic": {
-    "availableMemoryForUMInMiB": 51131,
+    "availableMemoryForUMInMiB": 30000,
     "optimize": true,
     "repeat": 1,
     "useUM": false,
@@ -28,7 +28,7 @@
     "byPassingFirstStep": false,
     "enableGapOverlap": true,
     "gapOverlapDecayFactor": 0.5,
-    "firstStepSolverType": "BRUTE_FORCE",
+    "firstStepSolverType": "BEAN_SEARCH",
     "enableEarlyTermination": true,
     "maxSolverIterations": 1000000,
     "beamWidth": 100,
@@ -51,8 +51,8 @@
     "gurobiMipGap": 0.50,
     "gurobiThreads": 0,
     "gurobiEnableHeuristics": false,
-    "disableLookahead": true,
-    "disableLookback":true
+    "disableLookahead": false,
+    "disableLookback":false
   },
   "tiledCholesky": {
     "mode": 0,
