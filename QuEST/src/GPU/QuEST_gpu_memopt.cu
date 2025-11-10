@@ -981,6 +981,10 @@ void statevec_destroyQureg(Qureg qureg, QuESTEnv env) {
 }
 
 void applyFullQFTWithMemopt(Qureg* qureg) {
+  // Start total preprocessing timer
+  memopt::SystemWallClock totalPreprocessingClock;
+  totalPreprocessingClock.start();
+  
   size_t totalShardSize = 0;
   auto& memManager = memopt::MemoryManager::getInstance();
   const auto& memoryInfos = memManager.getMemoryArrayInfos();
@@ -992,14 +996,34 @@ void applyFullQFTWithMemopt(Qureg* qureg) {
   cudaStream_t stream;
   checkCudaErrors(cudaStreamCreate(&stream));
 
+  // Time graph capture/generation
+  memopt::SystemWallClock graphCaptureClock;
+  graphCaptureClock.start();
+  
   cudaGraph_t graph = captureCudaGraphForFullQFT(stream, *qureg);
+  
+  graphCaptureClock.end();
+  printf("[TIMING] Graph capture time: %.3f seconds\n", graphCaptureClock.getTimeInSeconds());
 
   printf("Number of tasks = %llu\n", memopt_adapter::tasks.size());
 
   checkCudaErrors(cudaGraphDebugDotPrint(graph, "graph.dot", cudaGraphDebugDotFlagsVerbose));
 
   if (memopt::ConfigurationManager::getConfig().generic.optimize) {
+    // Time profiling and optimization
+    memopt::SystemWallClock optimizationClock;
+    optimizationClock.start();
+    
     auto optimizedGraph = memopt::profileAndOptimize(graph);
+    
+    optimizationClock.end();
+    printf("[TIMING] Profiling & Optimization time: %.3f seconds\n", optimizationClock.getTimeInSeconds());
+    
+    // Report total preprocessing time
+    totalPreprocessingClock.end();
+    printf("\n[TIMING SUMMARY] Total preprocessing time: %.3f seconds\n", totalPreprocessingClock.getTimeInSeconds());
+    printf("  - Graph generation: %.3f seconds\n", graphCaptureClock.getTimeInSeconds());
+    printf("  - Profiling & Optimization: %.3f seconds\n\n", optimizationClock.getTimeInSeconds());
 
     statevec_initZeroState(*qureg);
 
